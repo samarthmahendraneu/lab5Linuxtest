@@ -62,11 +62,6 @@ static int ic_inum = -1;
 static int ic_dirty = 0;
 static struct fs_inode ic_inode;
 
-/* Constants for indirect pointers */
-#define NUM_DIRECT 1016
-#define NUM_INDIRECT 3
-#define PTRS_PER_BLOCK (FS_BLOCK_SIZE / sizeof(uint32_t))
-
 /* bitmap functions
  */
 void bit_set(unsigned char *map, int i)
@@ -167,129 +162,6 @@ static int load_inode_cache(int inum) {
     ic_inum = inum;
     ic_dirty = 0;
     return 0;
-}
-
-/* Helper functions for indirect pointers */
-
-/* Get block number for logical block index (supports indirect pointers)
- * Returns: block number or 0 if not allocated
- */
-static int get_block_num(struct fs_inode *inode, int block_idx) {
-    if (block_idx < 0) return 0;
-
-    /* Direct pointers */
-    if (block_idx < NUM_DIRECT) {
-        return inode->ptrs[block_idx];
-    }
-
-    /* Indirect pointers */
-    block_idx -= NUM_DIRECT;
-    int indirect_idx = block_idx / PTRS_PER_BLOCK;
-    int offset_in_indirect = block_idx % PTRS_PER_BLOCK;
-
-    if (indirect_idx >= NUM_INDIRECT) {
-        return 0;  /* Beyond max file size */
-    }
-
-    int indirect_block = inode->ptrs[NUM_DIRECT + indirect_idx];
-    if (indirect_block == 0) {
-        return 0;  /* Indirect block not allocated */
-    }
-
-    /* Read the indirect block */
-    uint32_t indirect_ptrs[PTRS_PER_BLOCK];
-    if (block_read(indirect_ptrs, indirect_block, 1) < 0) {
-        return -EIO;
-    }
-
-    return indirect_ptrs[offset_in_indirect];
-}
-
-/* Set block number for logical block index (supports indirect pointers)
- * Returns: 0 on success, negative on error
- */
-static int set_block_num(struct fs_inode *inode, int block_idx, int block_num) {
-    if (block_idx < 0) return -EINVAL;
-
-    /* Direct pointers */
-    if (block_idx < NUM_DIRECT) {
-        inode->ptrs[block_idx] = block_num;
-        return 0;
-    }
-
-    /* Indirect pointers */
-    block_idx -= NUM_DIRECT;
-    int indirect_idx = block_idx / PTRS_PER_BLOCK;
-    int offset_in_indirect = block_idx % PTRS_PER_BLOCK;
-
-    if (indirect_idx >= NUM_INDIRECT) {
-        return -ENOSPC;  /* Beyond max file size */
-    }
-
-    int indirect_block = inode->ptrs[NUM_DIRECT + indirect_idx];
-
-    /* Allocate indirect block if needed */
-    if (indirect_block == 0) {
-        indirect_block = alloc_blk();
-        if (indirect_block < 0) return indirect_block;
-
-        inode->ptrs[NUM_DIRECT + indirect_idx] = indirect_block;
-
-        /* Initialize indirect block with zeros */
-        uint32_t indirect_ptrs[PTRS_PER_BLOCK];
-        memset(indirect_ptrs, 0, sizeof(indirect_ptrs));
-        if (block_write(indirect_ptrs, indirect_block, 1) < 0) {
-            free_blk(indirect_block);
-            inode->ptrs[NUM_DIRECT + indirect_idx] = 0;
-            return -EIO;
-        }
-    }
-
-    /* Read indirect block, update pointer, write back */
-    uint32_t indirect_ptrs[PTRS_PER_BLOCK];
-    if (block_read(indirect_ptrs, indirect_block, 1) < 0) {
-        return -EIO;
-    }
-
-    indirect_ptrs[offset_in_indirect] = block_num;
-
-    if (block_write(indirect_ptrs, indirect_block, 1) < 0) {
-        return -EIO;
-    }
-
-    return 0;
-}
-
-/* Free all data blocks associated with a file (direct and indirect)
- */
-static void free_all_blocks(struct fs_inode *inode) {
-    /* Free direct blocks */
-    for (int i = 0; i < NUM_DIRECT; i++) {
-        if (inode->ptrs[i] != 0) {
-            free_blk(inode->ptrs[i]);
-            inode->ptrs[i] = 0;
-        }
-    }
-
-    /* Free indirect blocks */
-    for (int i = 0; i < NUM_INDIRECT; i++) {
-        int indirect_block = inode->ptrs[NUM_DIRECT + i];
-        if (indirect_block != 0) {
-            /* Read the indirect block */
-            uint32_t indirect_ptrs[PTRS_PER_BLOCK];
-            if (block_read(indirect_ptrs, indirect_block, 1) >= 0) {
-                /* Free all data blocks pointed to by this indirect block */
-                for (int j = 0; j < PTRS_PER_BLOCK; j++) {
-                    if (indirect_ptrs[j] != 0) {
-                        free_blk(indirect_ptrs[j]);
-                    }
-                }
-            }
-            /* Free the indirect block itself */
-            free_blk(indirect_block);
-            inode->ptrs[NUM_DIRECT + i] = 0;
-        }
-    }
 }
 
 
@@ -484,17 +356,6 @@ void inode2stat(struct stat *sb, struct fs_inode *in, uint32_t inode_num)
  */
 void* fs_init(struct fuse_conn_info *conn)
 {
-    /* RESET ALL GLOBAL STATE - critical for mounting multiple images */
-    next_free_blk = 3;
-
-    cache_valid = 0;
-    cache_lba = -1;
-    cache_dirty = 0;
-
-    ic_valid = 0;
-    ic_inum = -1;
-    ic_dirty = 0;
-
     if (block_read(&superblock, 0, 1) < 0) {
         fprintf(stderr, "Failed to read superblock\n");
         exit(1);
@@ -509,15 +370,6 @@ void* fs_init(struct fuse_conn_info *conn)
     if (block_read(block_bitmap, 1, 1) < 0) {
         fprintf(stderr, "Failed to read block bitmap\n");
         exit(1);
-    }
-
-    /* Initialize next_free_blk correctly */
-    next_free_blk = 0;
-    for (int i = 0; i < superblock.disk_size; i++) {
-        if (!bit_test(block_bitmap, i)) {
-            next_free_blk = i;
-            break;
-        }
     }
 
     return NULL;
@@ -714,11 +566,7 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
             bytes_to_read = len - bytes_read;
         }
 
-        int block_lba = get_block_num(inode_ptr, block_idx);
-        if (block_lba < 0) {
-            return block_lba;  /* Error reading indirect block */
-        }
-
+        int block_lba = inode_ptr->ptrs[block_idx];
         if (block_lba == 0) {
             memset(buf + bytes_read, 0, bytes_to_read);
         } else {
@@ -1229,8 +1077,11 @@ int fs_unlink(const char *path)
                 return -EIO;
             }
 
-            /* Free all data blocks (direct and indirect) */
-            free_all_blocks(inode_ptr);
+            for (int j = 0; j < (sizeof(inode_ptr->ptrs) / sizeof(inode_ptr->ptrs[0])); j++) {
+                if (inode_ptr->ptrs[j] != 0) {
+                    free_blk(inode_ptr->ptrs[j]);
+                }
+            }
 
             free_blk(inum);
             free(path_copy);
@@ -1367,8 +1218,7 @@ int fs_write(const char *path, const char *buf, size_t len,
         return -EINVAL;
     }
 
-    /* Calculate max file size with indirect pointers */
-    int max_file_size = (NUM_DIRECT + NUM_INDIRECT * PTRS_PER_BLOCK) * FS_BLOCK_SIZE;
+    int max_file_size = (sizeof(inode->ptrs) / sizeof(inode->ptrs[0])) * FS_BLOCK_SIZE;
     if (offset + len > max_file_size) {
         return -ENOSPC;
     }
@@ -1383,20 +1233,11 @@ int fs_write(const char *path, const char *buf, size_t len,
             bytes_to_write = len - bytes_written;
         }
 
-        int lba = get_block_num(inode, block_idx);
-        if (lba < 0) {
-            return lba;  /* Error */
-        }
-
+        int lba = inode->ptrs[block_idx];
         if (lba == 0) {
             int nb = alloc_blk();
             if (nb < 0) return nb;
-
-            int rv = set_block_num(inode, block_idx, nb);
-            if (rv < 0) {
-                free_blk(nb);
-                return rv;
-            }
+            inode->ptrs[block_idx] = nb;
             ic_dirty = 1;
 
             int frv = flush_block_cache();
@@ -1457,8 +1298,12 @@ int fs_truncate(const char *path, off_t len)
         return -EISDIR;
     }
 
-    /* Free all data blocks (direct and indirect) */
-    free_all_blocks(inode);
+    for (int i = 0; i < (sizeof(inode->ptrs) / sizeof(inode->ptrs[0])); i++) {
+        if (inode->ptrs[i] != 0) {
+            free_blk(inode->ptrs[i]);
+            inode->ptrs[i] = 0;
+        }
+    }
 
     inode->size = 0;
     inode->mtime = time(NULL);
