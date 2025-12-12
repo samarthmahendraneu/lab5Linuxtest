@@ -439,11 +439,19 @@ int fs_getattr(const char *path, struct stat *sb)
     }
 
     struct fs_inode inode;
-    if (block_read(&inode, inum, 1) < 0) {
-        return -EIO;
+    struct fs_inode *inode_ptr;
+
+    /* Check inode cache first */
+    if (ic_valid && ic_inum == inum) {
+        inode_ptr = &ic_inode;
+    } else {
+        if (block_read(&inode, inum, 1) < 0) {
+            return -EIO;
+        }
+        inode_ptr = &inode;
     }
 
-    inode2stat(sb, &inode, inum);
+    inode2stat(sb, inode_ptr, inum);
     return 0;
 }
 
@@ -719,16 +727,12 @@ int fs_chmod(const char *path, mode_t mode)
         return inum;
     }
 
-    struct fs_inode inode;
-    if (block_read(&inode, inum, 1) < 0) {
-        return -EIO;
-    }
+    int rv = load_inode_cache(inum);
+    if (rv < 0) return rv;
+    struct fs_inode *inode = &ic_inode;
 
-    inode.mode = (inode.mode & S_IFMT) | (mode & ~S_IFMT);
-
-    if (block_write(&inode, inum, 1) < 0) {
-        return -EIO;
-    }
+    inode->mode = (inode->mode & S_IFMT) | (mode & ~S_IFMT);
+    ic_dirty = 1;
 
     return 0;
 }
@@ -1012,11 +1016,19 @@ int fs_unlink(const char *path)
     }
 
     struct fs_inode inode;
-    if (block_read(&inode, inum, 1) < 0) {
-        return -EIO;
+    struct fs_inode *inode_ptr;
+
+    /* Check inode cache first */
+    if (ic_valid && ic_inum == inum) {
+        inode_ptr = &ic_inode;
+    } else {
+        if (block_read(&inode, inum, 1) < 0) {
+            return -EIO;
+        }
+        inode_ptr = &inode;
     }
 
-    if (S_ISDIR(inode.mode)) {
+    if (S_ISDIR(inode_ptr->mode)) {
         return -EISDIR;
     }
 
@@ -1065,9 +1077,9 @@ int fs_unlink(const char *path)
                 return -EIO;
             }
 
-            for (int j = 0; j < (sizeof(inode.ptrs) / sizeof(inode.ptrs[0])); j++) {
-                if (inode.ptrs[j] != 0) {
-                    free_blk(inode.ptrs[j]);
+            for (int j = 0; j < (sizeof(inode_ptr->ptrs) / sizeof(inode_ptr->ptrs[0])); j++) {
+                if (inode_ptr->ptrs[j] != 0) {
+                    free_blk(inode_ptr->ptrs[j]);
                 }
             }
 
@@ -1278,28 +1290,24 @@ int fs_truncate(const char *path, off_t len)
         return inum;
     }
 
-    struct fs_inode inode;
-    if (block_read(&inode, inum, 1) < 0) {
-        return -EIO;
-    }
+    int rv = load_inode_cache(inum);
+    if (rv < 0) return rv;
+    struct fs_inode *inode = &ic_inode;
 
-    if (S_ISDIR(inode.mode)) {
+    if (S_ISDIR(inode->mode)) {
         return -EISDIR;
     }
 
-    for (int i = 0; i < (sizeof(inode.ptrs) / sizeof(inode.ptrs[0])); i++) {
-        if (inode.ptrs[i] != 0) {
-            free_blk(inode.ptrs[i]);
-            inode.ptrs[i] = 0;
+    for (int i = 0; i < (sizeof(inode->ptrs) / sizeof(inode->ptrs[0])); i++) {
+        if (inode->ptrs[i] != 0) {
+            free_blk(inode->ptrs[i]);
+            inode->ptrs[i] = 0;
         }
     }
 
-    inode.size = 0;
-    inode.mtime = time(NULL);
-
-    if (block_write(&inode, inum, 1) < 0) {
-        return -EIO;
-    }
+    inode->size = 0;
+    inode->mtime = time(NULL);
+    ic_dirty = 1;
 
     return 0;
 }
@@ -1323,20 +1331,17 @@ int fs_utime(const char *path, struct utimbuf *ut)
         return inum;
     }
 
-    struct fs_inode inode;
-    if (block_read(&inode, inum, 1) < 0) {
-        return -EIO;
-    }
+    int rv = load_inode_cache(inum);
+    if (rv < 0) return rv;
+    struct fs_inode *inode = &ic_inode;
 
     if (ut == NULL) {
-        inode.mtime = time(NULL);
+        inode->mtime = time(NULL);
     } else {
-        inode.mtime = ut->modtime;
+        inode->mtime = ut->modtime;
     }
 
-    if (block_write(&inode, inum, 1) < 0) {
-        return -EIO;
-    }
+    ic_dirty = 1;
 
     return 0;
 }
