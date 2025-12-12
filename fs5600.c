@@ -484,6 +484,17 @@ void inode2stat(struct stat *sb, struct fs_inode *in, uint32_t inode_num)
  */
 void* fs_init(struct fuse_conn_info *conn)
 {
+    /* RESET ALL GLOBAL STATE - critical for mounting multiple images */
+    next_free_blk = 3;
+
+    cache_valid = 0;
+    cache_lba = -1;
+    cache_dirty = 0;
+
+    ic_valid = 0;
+    ic_inum = -1;
+    ic_dirty = 0;
+
     if (block_read(&superblock, 0, 1) < 0) {
         fprintf(stderr, "Failed to read superblock\n");
         exit(1);
