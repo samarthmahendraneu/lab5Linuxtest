@@ -500,6 +500,15 @@ void* fs_init(struct fuse_conn_info *conn)
         exit(1);
     }
 
+    /* Initialize next_free_blk correctly */
+    next_free_blk = 0;
+    for (int i = 0; i < superblock.disk_size; i++) {
+        if (!bit_test(block_bitmap, i)) {
+            next_free_blk = i;
+            break;
+        }
+    }
+
     return NULL;
 }
 
