@@ -326,7 +326,7 @@ int fs_statfs(const char *path, struct statvfs *st)
     st->f_blocks = superblock.disk_size - 2;
 
     int used_blocks = 0;
-    for (int i = 0; i < superblock.disk_size; i++) {
+    for (int i = 2; i < superblock.disk_size; i++) {
         if (bit_test(block_bitmap, i)) {
             used_blocks++;
         }
@@ -510,6 +510,11 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
  */
 int fs_rename(const char *src_path, const char *dst_path)
 {
+    int src_inum = path2inum(src_path);
+    if (src_inum < 0) {
+        return src_inum;
+    }
+
     char *src_copy = strdup(src_path);
     char *dst_copy = strdup(dst_path);
     char *src_parent = strdup(src_path);
@@ -540,15 +545,6 @@ int fs_rename(const char *src_path, const char *dst_path)
         free(src_parent);
         free(dst_parent);
         return -EINVAL;
-    }
-
-    int src_inum = path2inum(src_path);
-    if (src_inum < 0) {
-        free(src_copy);
-        free(dst_copy);
-        free(src_parent);
-        free(dst_parent);
-        return src_inum;
     }
 
     int dst_inum = path2inum(dst_path);
