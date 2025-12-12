@@ -76,7 +76,15 @@ int bit_test(unsigned char *map, int i)
  *   - bit_set/bit_test might be useful.
  */
 int alloc_blk() {
-    /* Your code here */
+    for (int i = 3; i < superblock.disk_size; i++) {
+        if (!bit_test(block_bitmap, i)) {
+            bit_set(block_bitmap, i);
+            if (block_write(block_bitmap, 1, 1) < 0) {
+                return -EIO;
+            }
+            return i;
+        }
+    }
     return -ENOSPC;
 }
 
@@ -87,7 +95,8 @@ int alloc_blk() {
  *   - bit_clear might be useful.
  */
 void free_blk(int i) {
-    /* your code here*/
+    bit_clear(block_bitmap, i);
+    block_write(block_bitmap, 1, 1);
 }
 
 
@@ -673,11 +682,99 @@ int fs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     uint16_t uid = ctx->uid;
     uint16_t gid = ctx->gid;
 
-    // get rid of compiling warnings; you should remove later
-    (void) uid, (void) gid, (void) cur_time;
+    char *path_copy = strdup(path);
+    char *filename = strrchr(path_copy, '/') + 1;
 
-    /* your code here */
-    return -EOPNOTSUPP;
+    if (strlen(filename) > 27) {
+        free(path_copy);
+        return -EINVAL;
+    }
+
+    if (path2inum(path) >= 0) {
+        free(path_copy);
+        return -EEXIST;
+    }
+
+    char *parent_path = strdup(path);
+    char *last_slash = strrchr(parent_path, '/');
+    if (last_slash == parent_path) {
+        strcpy(parent_path, "/");
+    } else {
+        *last_slash = '\0';
+    }
+
+    int parent_inum = path2inum(parent_path);
+    free(parent_path);
+
+    if (parent_inum < 0) {
+        free(path_copy);
+        return parent_inum;
+    }
+
+    struct fs_inode parent_inode;
+    if (block_read(&parent_inode, parent_inum, 1) < 0) {
+        free(path_copy);
+        return -EIO;
+    }
+
+    if (!S_ISDIR(parent_inode.mode)) {
+        free(path_copy);
+        return -ENOTDIR;
+    }
+
+    struct fs_dirent dir_entries[NUM_DIRENT_BLOCK];
+    if (block_read(dir_entries, parent_inode.ptrs[0], 1) < 0) {
+        free(path_copy);
+        return -EIO;
+    }
+
+    int free_entry = -1;
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (!dir_entries[i].valid) {
+            free_entry = i;
+            break;
+        }
+    }
+
+    if (free_entry == -1) {
+        free(path_copy);
+        return -ENOSPC;
+    }
+
+    int new_inum = alloc_blk();
+    if (new_inum < 0) {
+        free(path_copy);
+        return new_inum;
+    }
+
+    struct fs_inode new_inode;
+    memset(&new_inode, 0, sizeof(new_inode));
+    new_inode.uid = uid;
+    new_inode.gid = gid;
+    new_inode.mode = S_IFREG | mode;
+    new_inode.ctime = cur_time;
+    new_inode.mtime = cur_time;
+    new_inode.size = 0;
+
+    if (block_write(&new_inode, new_inum, 1) < 0) {
+        free_blk(new_inum);
+        free(path_copy);
+        return -EIO;
+    }
+
+    dir_entries[free_entry].valid = 1;
+    dir_entries[free_entry].inode = new_inum;
+    strncpy(dir_entries[free_entry].name, filename, 27);
+    dir_entries[free_entry].name[27] = '\0';
+
+    if (block_write(dir_entries, parent_inode.ptrs[0], 1) < 0) {
+        free_blk(new_inum);
+        free(path_copy);
+        return -EIO;
+    }
+
+    free(path_copy);
+    return 0;
 }
 
 
@@ -703,11 +800,118 @@ int fs_mkdir(const char *path, mode_t mode)
     uint16_t uid = ctx->uid;
     uint16_t gid = ctx->gid;
 
-    // get rid of compiling warnings; you should remove later
-    (void) uid, (void) gid, (void) cur_time;
+    char *path_copy = strdup(path);
+    char *dirname = strrchr(path_copy, '/') + 1;
 
-    /* your code here */
-    return -EOPNOTSUPP;
+    if (strlen(dirname) > 27) {
+        free(path_copy);
+        return -EINVAL;
+    }
+
+    if (path2inum(path) >= 0) {
+        free(path_copy);
+        return -EEXIST;
+    }
+
+    char *parent_path = strdup(path);
+    char *last_slash = strrchr(parent_path, '/');
+    if (last_slash == parent_path) {
+        strcpy(parent_path, "/");
+    } else {
+        *last_slash = '\0';
+    }
+
+    int parent_inum = path2inum(parent_path);
+    free(parent_path);
+
+    if (parent_inum < 0) {
+        free(path_copy);
+        return parent_inum;
+    }
+
+    struct fs_inode parent_inode;
+    if (block_read(&parent_inode, parent_inum, 1) < 0) {
+        free(path_copy);
+        return -EIO;
+    }
+
+    if (!S_ISDIR(parent_inode.mode)) {
+        free(path_copy);
+        return -ENOTDIR;
+    }
+
+    struct fs_dirent dir_entries[NUM_DIRENT_BLOCK];
+    if (block_read(dir_entries, parent_inode.ptrs[0], 1) < 0) {
+        free(path_copy);
+        return -EIO;
+    }
+
+    int free_entry = -1;
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (!dir_entries[i].valid) {
+            free_entry = i;
+            break;
+        }
+    }
+
+    if (free_entry == -1) {
+        free(path_copy);
+        return -ENOSPC;
+    }
+
+    int new_inum = alloc_blk();
+    if (new_inum < 0) {
+        free(path_copy);
+        return new_inum;
+    }
+
+    int data_blk = alloc_blk();
+    if (data_blk < 0) {
+        free_blk(new_inum);
+        free(path_copy);
+        return data_blk;
+    }
+
+    struct fs_dirent new_dir_entries[NUM_DIRENT_BLOCK];
+    memset(new_dir_entries, 0, sizeof(new_dir_entries));
+    if (block_write(new_dir_entries, data_blk, 1) < 0) {
+        free_blk(new_inum);
+        free_blk(data_blk);
+        free(path_copy);
+        return -EIO;
+    }
+
+    struct fs_inode new_inode;
+    memset(&new_inode, 0, sizeof(new_inode));
+    new_inode.uid = uid;
+    new_inode.gid = gid;
+    new_inode.mode = S_IFDIR | mode;
+    new_inode.ctime = cur_time;
+    new_inode.mtime = cur_time;
+    new_inode.size = FS_BLOCK_SIZE;
+    new_inode.ptrs[0] = data_blk;
+
+    if (block_write(&new_inode, new_inum, 1) < 0) {
+        free_blk(new_inum);
+        free_blk(data_blk);
+        free(path_copy);
+        return -EIO;
+    }
+
+    dir_entries[free_entry].valid = 1;
+    dir_entries[free_entry].inode = new_inum;
+    strncpy(dir_entries[free_entry].name, dirname, 27);
+    dir_entries[free_entry].name[27] = '\0';
+
+    if (block_write(dir_entries, parent_inode.ptrs[0], 1) < 0) {
+        free_blk(new_inum);
+        free_blk(data_blk);
+        free(path_copy);
+        return -EIO;
+    }
+
+    free(path_copy);
+    return 0;
 }
 
 
