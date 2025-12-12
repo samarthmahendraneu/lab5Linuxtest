@@ -1133,11 +1133,11 @@ int fs_write(const char *path, const char *buf, size_t len,
         return -ENOSPC;
     }
 
-    int bytes_written = 0;
+    size_t bytes_written = 0;
     while (bytes_written < len) {
         int block_idx = (offset + bytes_written) / FS_BLOCK_SIZE;
         int block_offset = (offset + bytes_written) % FS_BLOCK_SIZE;
-        int bytes_to_write = FS_BLOCK_SIZE - block_offset;
+        size_t bytes_to_write = FS_BLOCK_SIZE - block_offset;
 
         if (bytes_to_write > len - bytes_written) {
             bytes_to_write = len - bytes_written;
