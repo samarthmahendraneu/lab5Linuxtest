@@ -51,6 +51,17 @@ static struct fs_super superblock;
 static unsigned char block_bitmap[FS_BLOCK_SIZE];
 static int next_free_blk = 3;
 
+/* Write-back cache */
+static int cache_valid = 0;
+static int cache_lba = -1;
+static int cache_dirty = 0;
+static unsigned char cache_buf[FS_BLOCK_SIZE];
+
+static int ic_valid = 0;
+static int ic_inum = -1;
+static int ic_dirty = 0;
+static struct fs_inode ic_inode;
+
 /* bitmap functions
  */
 void bit_set(unsigned char *map, int i)
@@ -97,8 +108,60 @@ int alloc_blk() {
  *   - bit_clear might be useful.
  */
 void free_blk(int i) {
+    if (cache_valid && cache_lba == i) {
+        cache_valid = 0;
+        cache_dirty = 0;
+        cache_lba = -1;
+    }
+    if (ic_valid && ic_inum == i) {
+        ic_valid = 0;
+        ic_dirty = 0;
+        ic_inum = -1;
+    }
+
     bit_clear(block_bitmap, i);
     block_write(block_bitmap, 1, 1);
+}
+
+/* Cache helper functions */
+static int flush_block_cache(void) {
+    if (cache_valid && cache_dirty) {
+        if (block_write(cache_buf, cache_lba, 1) < 0) return -EIO;
+        cache_dirty = 0;
+    }
+    return 0;
+}
+
+static int load_block_cache(int lba) {
+    if (cache_valid && cache_lba == lba) return 0;
+    int rv = flush_block_cache();
+    if (rv < 0) return rv;
+
+    if (block_read(cache_buf, lba, 1) < 0) return -EIO;
+    cache_valid = 1;
+    cache_lba = lba;
+    cache_dirty = 0;
+    return 0;
+}
+
+static int flush_inode_cache(void) {
+    if (ic_valid && ic_dirty) {
+        if (block_write(&ic_inode, ic_inum, 1) < 0) return -EIO;
+        ic_dirty = 0;
+    }
+    return 0;
+}
+
+static int load_inode_cache(int inum) {
+    if (ic_valid && ic_inum == inum) return 0;
+    int rv = flush_inode_cache();
+    if (rv < 0) return rv;
+
+    if (block_read(&ic_inode, inum, 1) < 0) return -EIO;
+    ic_valid = 1;
+    ic_inum = inum;
+    ic_dirty = 0;
+    return 0;
 }
 
 
@@ -461,20 +524,28 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
     }
 
     struct fs_inode inode;
-    if (block_read(&inode, inum, 1) < 0) {
-        return -EIO;
+    struct fs_inode *inode_ptr;
+
+    /* Check inode cache first */
+    if (ic_valid && ic_inum == inum) {
+        inode_ptr = &ic_inode;
+    } else {
+        if (block_read(&inode, inum, 1) < 0) {
+            return -EIO;
+        }
+        inode_ptr = &inode;
     }
 
-    if (S_ISDIR(inode.mode)) {
+    if (S_ISDIR(inode_ptr->mode)) {
         return -EISDIR;
     }
 
-    if (offset >= inode.size) {
+    if (offset >= inode_ptr->size) {
         return 0;
     }
 
-    if (offset + len > inode.size) {
-        len = inode.size - offset;
+    if (offset + len > inode_ptr->size) {
+        len = inode_ptr->size - offset;
     }
 
     int bytes_read = 0;
@@ -487,14 +558,20 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
             bytes_to_read = len - bytes_read;
         }
 
-        if (inode.ptrs[block_idx] == 0) {
+        int block_lba = inode_ptr->ptrs[block_idx];
+        if (block_lba == 0) {
             memset(buf + bytes_read, 0, bytes_to_read);
         } else {
-            char block_buf[FS_BLOCK_SIZE];
-            if (block_read(block_buf, inode.ptrs[block_idx], 1) < 0) {
-                return -EIO;
+            /* Check if block is in cache */
+            if (cache_valid && cache_lba == block_lba) {
+                memcpy(buf + bytes_read, cache_buf + block_offset, bytes_to_read);
+            } else {
+                char block_buf[FS_BLOCK_SIZE];
+                if (block_read(block_buf, block_lba, 1) < 0) {
+                    return -EIO;
+                }
+                memcpy(buf + bytes_read, block_buf + block_offset, bytes_to_read);
             }
-            memcpy(buf + bytes_read, block_buf + block_offset, bytes_to_read);
         }
 
         bytes_read += bytes_to_read;
@@ -1117,20 +1194,19 @@ int fs_write(const char *path, const char *buf, size_t len,
         return inum;
     }
 
-    struct fs_inode inode;
-    if (block_read(&inode, inum, 1) < 0) {
-        return -EIO;
-    }
+    int rv = load_inode_cache(inum);
+    if (rv < 0) return rv;
+    struct fs_inode *inode = &ic_inode;
 
-    if (S_ISDIR(inode.mode)) {
+    if (S_ISDIR(inode->mode)) {
         return -EISDIR;
     }
 
-    if (offset > inode.size) {
+    if (offset > inode->size) {
         return -EINVAL;
     }
 
-    int max_file_size = (sizeof(inode.ptrs) / sizeof(inode.ptrs[0])) * FS_BLOCK_SIZE;
+    int max_file_size = (sizeof(inode->ptrs) / sizeof(inode->ptrs[0])) * FS_BLOCK_SIZE;
     if (offset + len > max_file_size) {
         return -ENOSPC;
     }
@@ -1145,44 +1221,39 @@ int fs_write(const char *path, const char *buf, size_t len,
             bytes_to_write = len - bytes_written;
         }
 
-        if (inode.ptrs[block_idx] == 0) {
-            int new_blk = alloc_blk();
-            if (new_blk < 0) {
-                return new_blk;
-            }
-            inode.ptrs[block_idx] = new_blk;
+        int lba = inode->ptrs[block_idx];
+        if (lba == 0) {
+            int nb = alloc_blk();
+            if (nb < 0) return nb;
+            inode->ptrs[block_idx] = nb;
+            ic_dirty = 1;
 
-            char zero_block[FS_BLOCK_SIZE];
-            memset(zero_block, 0, FS_BLOCK_SIZE);
-            if (block_write(zero_block, new_blk, 1) < 0) {
-                return -EIO;
-            }
+            int frv = flush_block_cache();
+            if (frv < 0) return frv;
+
+            cache_valid = 1;
+            cache_lba = nb;
+            memset(cache_buf, 0, FS_BLOCK_SIZE);
+            cache_dirty = 1;
+        } else {
+            int brv = load_block_cache(lba);
+            if (brv < 0) return brv;
         }
 
-        char block_buf[FS_BLOCK_SIZE];
-        if (block_read(block_buf, inode.ptrs[block_idx], 1) < 0) {
-            return -EIO;
-        }
-
-        memcpy(block_buf + block_offset, buf + bytes_written, bytes_to_write);
-
-        if (block_write(block_buf, inode.ptrs[block_idx], 1) < 0) {
-            return -EIO;
-        }
+        memcpy(cache_buf + block_offset, buf + bytes_written, bytes_to_write);
+        cache_dirty = 1;
 
         bytes_written += bytes_to_write;
     }
 
-    if (offset + len > inode.size) {
-        inode.size = offset + len;
+    if (offset + len > inode->size) {
+        inode->size = offset + len;
     }
 
-    inode.mtime = time(NULL);
-    if (block_write(&inode, inum, 1) < 0) {
-        return -EIO;
-    }
+    inode->mtime = time(NULL);
+    ic_dirty = 1;
 
-    return bytes_written;
+    return len;
 }
 
 /* EXERCISE 6:
