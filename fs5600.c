@@ -49,6 +49,7 @@ extern int block_write(void *buf, int lba, int nblks);
 /* Global variables */
 static struct fs_super superblock;
 static unsigned char block_bitmap[FS_BLOCK_SIZE];
+static int next_free_blk = 3;
 
 /* bitmap functions
  */
@@ -76,9 +77,10 @@ int bit_test(unsigned char *map, int i)
  *   - bit_set/bit_test might be useful.
  */
 int alloc_blk() {
-    for (int i = 3; i < superblock.disk_size; i++) {
+    for (int i = next_free_blk; i < superblock.disk_size; i++) {
         if (!bit_test(block_bitmap, i)) {
             bit_set(block_bitmap, i);
+            next_free_blk = i + 1;
             if (block_write(block_bitmap, 1, 1) < 0) {
                 return -EIO;
             }
@@ -1146,12 +1148,7 @@ int fs_write(const char *path, const char *buf, size_t len,
         if (inode.ptrs[block_idx] == 0) {
             int new_blk = alloc_blk();
             if (new_blk < 0) {
-                if (bytes_written > 0) {
-                    inode.size = offset + bytes_written;
-                    inode.mtime = time(NULL);
-                    block_write(&inode, inum, 1);
-                }
-                return bytes_written > 0 ? bytes_written : new_blk;
+                return new_blk;
             }
             inode.ptrs[block_idx] = new_blk;
 
