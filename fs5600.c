@@ -927,8 +927,79 @@ int fs_mkdir(const char *path, mode_t mode)
  */
 int fs_unlink(const char *path)
 {
-    /* your code here */
-    return -EOPNOTSUPP;
+    int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;
+    }
+
+    struct fs_inode inode;
+    if (block_read(&inode, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (S_ISDIR(inode.mode)) {
+        return -EISDIR;
+    }
+
+    char *path_copy = strdup(path);
+    char *filename = strrchr(path_copy, '/') + 1;
+    char *parent_path = strdup(path);
+    char *last_slash = strrchr(parent_path, '/');
+    if (last_slash == parent_path) {
+        strcpy(parent_path, "/");
+    } else {
+        *last_slash = '\0';
+    }
+
+    int parent_inum = path2inum(parent_path);
+    free(parent_path);
+
+    if (parent_inum < 0) {
+        free(path_copy);
+        return parent_inum;
+    }
+
+    struct fs_inode parent_inode;
+    if (block_read(&parent_inode, parent_inum, 1) < 0) {
+        free(path_copy);
+        return -EIO;
+    }
+
+    struct fs_dirent dir_entries[NUM_DIRENT_BLOCK];
+    if (block_read(dir_entries, parent_inode.ptrs[0], 1) < 0) {
+        free(path_copy);
+        return -EIO;
+    }
+
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (dir_entries[i].valid && strcmp(dir_entries[i].name, filename) == 0) {
+            dir_entries[i].valid = 0;
+
+            parent_inode.mtime = time(NULL);
+            if (block_write(&parent_inode, parent_inum, 1) < 0) {
+                free(path_copy);
+                return -EIO;
+            }
+
+            if (block_write(dir_entries, parent_inode.ptrs[0], 1) < 0) {
+                free(path_copy);
+                return -EIO;
+            }
+
+            for (int j = 0; j < (sizeof(inode.ptrs) / sizeof(inode.ptrs[0])); j++) {
+                if (inode.ptrs[j] != 0) {
+                    free_blk(inode.ptrs[j]);
+                }
+            }
+
+            free_blk(inum);
+            free(path_copy);
+            return 0;
+        }
+    }
+
+    free(path_copy);
+    return -ENOENT;
 }
 
 /* EXERCISE 5:
@@ -941,8 +1012,88 @@ int fs_unlink(const char *path)
  */
 int fs_rmdir(const char *path)
 {
-    /* your code here */
-    return -EOPNOTSUPP;
+    int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;
+    }
+
+    struct fs_inode inode;
+    if (block_read(&inode, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (!S_ISDIR(inode.mode)) {
+        return -ENOTDIR;
+    }
+
+    struct fs_dirent dir_entries[NUM_DIRENT_BLOCK];
+    if (block_read(dir_entries, inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (dir_entries[i].valid) {
+            return -ENOTEMPTY;
+        }
+    }
+
+    char *path_copy = strdup(path);
+    char *dirname = strrchr(path_copy, '/') + 1;
+    char *parent_path = strdup(path);
+    char *last_slash = strrchr(parent_path, '/');
+    if (last_slash == parent_path) {
+        strcpy(parent_path, "/");
+    } else {
+        *last_slash = '\0';
+    }
+
+    int parent_inum = path2inum(parent_path);
+    free(parent_path);
+
+    if (parent_inum < 0) {
+        free(path_copy);
+        return parent_inum;
+    }
+
+    struct fs_inode parent_inode;
+    if (block_read(&parent_inode, parent_inum, 1) < 0) {
+        free(path_copy);
+        return -EIO;
+    }
+
+    struct fs_dirent parent_entries[NUM_DIRENT_BLOCK];
+    if (block_read(parent_entries, parent_inode.ptrs[0], 1) < 0) {
+        free(path_copy);
+        return -EIO;
+    }
+
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (parent_entries[i].valid && strcmp(parent_entries[i].name, dirname) == 0) {
+            parent_entries[i].valid = 0;
+
+            parent_inode.mtime = time(NULL);
+            if (block_write(&parent_inode, parent_inum, 1) < 0) {
+                free(path_copy);
+                return -EIO;
+            }
+
+            if (block_write(parent_entries, parent_inode.ptrs[0], 1) < 0) {
+                free(path_copy);
+                return -EIO;
+            }
+
+            if (inode.ptrs[0] != 0) {
+                free_blk(inode.ptrs[0]);
+            }
+
+            free_blk(inum);
+            free(path_copy);
+            return 0;
+        }
+    }
+
+    free(path_copy);
+    return -ENOENT;
 }
 
 /* EXERCISE 6:
@@ -959,8 +1110,82 @@ int fs_rmdir(const char *path)
 int fs_write(const char *path, const char *buf, size_t len,
          off_t offset, struct fuse_file_info *fi)
 {
-    /* your code here */
-    return -EOPNOTSUPP;
+    int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;
+    }
+
+    struct fs_inode inode;
+    if (block_read(&inode, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (S_ISDIR(inode.mode)) {
+        return -EISDIR;
+    }
+
+    if (offset > inode.size) {
+        return -EINVAL;
+    }
+
+    int max_file_size = (sizeof(inode.ptrs) / sizeof(inode.ptrs[0])) * FS_BLOCK_SIZE;
+    if (offset + len > max_file_size) {
+        return -ENOSPC;
+    }
+
+    int bytes_written = 0;
+    while (bytes_written < len) {
+        int block_idx = (offset + bytes_written) / FS_BLOCK_SIZE;
+        int block_offset = (offset + bytes_written) % FS_BLOCK_SIZE;
+        int bytes_to_write = FS_BLOCK_SIZE - block_offset;
+
+        if (bytes_to_write > len - bytes_written) {
+            bytes_to_write = len - bytes_written;
+        }
+
+        if (inode.ptrs[block_idx] == 0) {
+            int new_blk = alloc_blk();
+            if (new_blk < 0) {
+                if (bytes_written > 0) {
+                    inode.size = offset + bytes_written;
+                    inode.mtime = time(NULL);
+                    block_write(&inode, inum, 1);
+                }
+                return bytes_written > 0 ? bytes_written : new_blk;
+            }
+            inode.ptrs[block_idx] = new_blk;
+
+            char zero_block[FS_BLOCK_SIZE];
+            memset(zero_block, 0, FS_BLOCK_SIZE);
+            if (block_write(zero_block, new_blk, 1) < 0) {
+                return -EIO;
+            }
+        }
+
+        char block_buf[FS_BLOCK_SIZE];
+        if (block_read(block_buf, inode.ptrs[block_idx], 1) < 0) {
+            return -EIO;
+        }
+
+        memcpy(block_buf + block_offset, buf + bytes_written, bytes_to_write);
+
+        if (block_write(block_buf, inode.ptrs[block_idx], 1) < 0) {
+            return -EIO;
+        }
+
+        bytes_written += bytes_to_write;
+    }
+
+    if (offset + len > inode.size) {
+        inode.size = offset + len;
+    }
+
+    inode.mtime = time(NULL);
+    if (block_write(&inode, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return bytes_written;
 }
 
 /* EXERCISE 6:
@@ -980,8 +1205,35 @@ int fs_truncate(const char *path, off_t len)
         return -EINVAL;        /* invalid argument */
     }
 
-    /* your code here */
-    return -EOPNOTSUPP;
+    int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;
+    }
+
+    struct fs_inode inode;
+    if (block_read(&inode, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (S_ISDIR(inode.mode)) {
+        return -EISDIR;
+    }
+
+    for (int i = 0; i < (sizeof(inode.ptrs) / sizeof(inode.ptrs[0])); i++) {
+        if (inode.ptrs[i] != 0) {
+            free_blk(inode.ptrs[i]);
+            inode.ptrs[i] = 0;
+        }
+    }
+
+    inode.size = 0;
+    inode.mtime = time(NULL);
+
+    if (block_write(&inode, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return 0;
 }
 
 /* EXERCISE 6:
@@ -998,9 +1250,27 @@ int fs_truncate(const char *path, off_t len)
  */
 int fs_utime(const char *path, struct utimbuf *ut)
 {
-    /* your code here */
-    return -EOPNOTSUPP;
+    int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;
+    }
 
+    struct fs_inode inode;
+    if (block_read(&inode, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (ut == NULL) {
+        inode.mtime = time(NULL);
+    } else {
+        inode.mtime = ut->modtime;
+    }
+
+    if (block_write(&inode, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return 0;
 }
 
 
