@@ -1352,15 +1352,25 @@ int fs_utime(const char *path, struct utimbuf *ut)
  *
  * success - return 0
  * errors - EIO on write failure
+ *
+ * Critical: Must flush in correct order for crash consistency:
+ *   1. Data blocks first (so inode never points to garbage)
+ *   2. Inode metadata (size, pointers)
+ *   3. Allocation bitmap (so blocks are marked as used)
  */
 int fs_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 {
-    /* Flush both caches to ensure data consistency */
-    int rv1 = flush_block_cache();
-    int rv2 = flush_inode_cache();
+    /* 1. Flush dirty data block */
+    if (flush_block_cache() < 0)
+        return -EIO;
 
-    if (rv1 < 0) return rv1;
-    if (rv2 < 0) return rv2;
+    /* 2. Flush inode metadata */
+    if (flush_inode_cache() < 0)
+        return -EIO;
+
+    /* 3. Flush allocation bitmap */
+    if (block_write(block_bitmap, 1, 1) < 0)
+        return -EIO;
 
     return 0;
 }
@@ -1368,12 +1378,18 @@ int fs_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 /* EXERCISE 7:
  * destroy - called when filesystem is unmounted
  * Ensures all cached data is written to disk before shutdown.
+ *
+ * Must flush everything in the correct order:
+ *   1. Data blocks
+ *   2. Inode metadata
+ *   3. Allocation bitmap
  */
 void fs_destroy(void *private_data)
 {
-    /* Flush all caches before unmounting */
+    /* Flush all caches before unmounting (same order as fsync) */
     flush_block_cache();
     flush_inode_cache();
+    block_write(block_bitmap, 1, 1);
 }
 
 
