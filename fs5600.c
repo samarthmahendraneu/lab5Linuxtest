@@ -1346,6 +1346,35 @@ int fs_utime(const char *path, struct utimbuf *ut)
     return 0;
 }
 
+/* EXERCISE 7:
+ * fsync - synchronize file data to disk
+ * Forces any cached writes to be written to disk.
+ *
+ * success - return 0
+ * errors - EIO on write failure
+ */
+int fs_fsync(const char *path, int datasync, struct fuse_file_info *fi)
+{
+    /* Flush both caches to ensure data consistency */
+    int rv1 = flush_block_cache();
+    int rv2 = flush_inode_cache();
+
+    if (rv1 < 0) return rv1;
+    if (rv2 < 0) return rv2;
+
+    return 0;
+}
+
+/* EXERCISE 7:
+ * destroy - called when filesystem is unmounted
+ * Ensures all cached data is written to disk before shutdown.
+ */
+void fs_destroy(void *private_data)
+{
+    /* Flush all caches before unmounting */
+    flush_block_cache();
+    flush_inode_cache();
+}
 
 
 /* operations vector. Please don't rename it, or else you'll break things
@@ -1366,5 +1395,8 @@ struct fuse_operations fs_ops = {
     .write = fs_write,
     .truncate = fs_truncate,
     .utime = fs_utime,
+
+    .fsync = fs_fsync,          /* cache management */
+    .destroy = fs_destroy,
 };
 
